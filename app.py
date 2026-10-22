@@ -4,12 +4,17 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from pptx import Presentation
 from pypdf import PdfReader
 
 DEFAULT_MODEL = "gemini-3.5-flash"
+# Tried in order if the chosen model is overloaded (503) or unavailable
+FALLBACK_MODELS = ["gemini-3-flash-preview", "gemini-2.5-flash"]
+MAX_ATTEMPTS = 3  # tries per model for temporary errors
+RETRY_DELAY = 2  # seconds; doubles after each failed try
 MAX_CHARS = 60_000  # keeps the prompt well inside the model's limits
 MIN_CHARS = 200  # below this the file is probably scanned images
 NUM_QUESTIONS = 10
@@ -161,21 +166,66 @@ def validate_result(data: dict) -> dict:
     return {"summary": summary, "key_points": points, "quiz": quiz, "flashcards": cards}
 
 
+def _error_code(exc):
+    code = getattr(exc, "code", None)
+    return code if isinstance(code, int) else None
+
+
+def is_transient(exc) -> bool:
+    """Temporary Google-side problems: overload, rate limit, server errors."""
+    text = str(exc).upper()
+    return _error_code(exc) in (429, 500, 502, 503, 504) or any(
+        w in text for w in ("UNAVAILABLE", "OVERLOADED", "HIGH DEMAND", "RESOURCE_EXHAUSTED")
+    )
+
+
+def is_model_missing(exc) -> bool:
+    return _error_code(exc) == 404 or "NOT_FOUND" in str(exc).upper()
+
+
+def _call_model(client, model, prompt, config):
+    """One model call with retries and increasing waits for temporary errors."""
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            return client.models.generate_content(model=model, contents=prompt, config=config)
+        except Exception as exc:
+            if not is_transient(exc) or attempt == MAX_ATTEMPTS - 1:
+                raise
+            time.sleep(RETRY_DELAY * 2**attempt)
+
+
 def generate_study_kit(client, model: str, text: str, num_cards: int) -> dict:
-    """Call Gemini and return validated study material. Retries once on bad JSON."""
+    """Call Gemini and return validated study material.
+
+    Retries temporary errors, falls back to other Flash models, and retries once on bad JSON.
+    """
     from google.genai import types  # imported here so the file reads/tests without the SDK
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json", temperature=0.4
     )
     prompt = build_prompt(text[:MAX_CHARS], num_cards)
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error = None
-    for _ in range(2):
-        response = client.models.generate_content(model=model, contents=prompt, config=config)
+    for name in models:
         try:
-            return validate_result(parse_json(response.text))
-        except (ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
+            for _ in range(2):  # second try only for unreadable JSON
+                response = _call_model(client, name, prompt, config)
+                try:
+                    result = validate_result(parse_json(response.text))
+                    result["model_used"] = name
+                    return result
+                except (ValueError, json.JSONDecodeError) as exc:
+                    last_error = exc
+        except Exception as exc:
+            if is_transient(exc) or is_model_missing(exc):
+                last_error = exc  # try the next model
+                continue
+            raise  # e.g. invalid API key: no point trying other models
+    if last_error is not None and is_transient(last_error):
+        raise ValueError(
+            "Google's AI servers are very busy right now. Please wait a minute and click Generate again."
+        )
     raise ValueError(f"Could not read the AI response ({last_error}). Please try again.")
 
 
@@ -287,6 +337,8 @@ def main():
 
     result = st.session_state.get("result")
     if result:
+        if result.get("model_used") and result["model_used"] != (model.strip() or DEFAULT_MODEL):
+            st.caption(f"Your chosen model was busy, so this kit was made with {result['model_used']}.")
         tab_summary, tab_quiz, tab_cards = st.tabs(["📝 Summary", "❓ Quiz", "🗂️ Flashcards"])
         with tab_summary:
             st.write(result["summary"])
